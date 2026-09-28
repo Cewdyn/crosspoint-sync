@@ -292,4 +292,50 @@ describe('removing a synced book', () => {
     const res = await app.request('/api/v1/progress/not%20a%20hash!', { method: 'DELETE', headers });
     expect(res.status).toBe(403);
   });
+
+  it('kosync GET returns the furthest-along device, not just whoever synced last', async () => {
+    // A lagging device (e.g. one that hasn't been opened in a while) re-syncing
+    // its own old, behind position must never make a book look like it regressed
+    // for a device that's actually further along.
+    const { app } = makeTestApp();
+    const { headers } = await registerUser(app);
+    await app.request('/syncs/progress', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ document: DOC, progress: 'ahead', percentage: 0.6, device_id: 'reader-a' }),
+    });
+    await app.request('/syncs/progress', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ document: DOC, progress: 'behind', percentage: 0.05, device_id: 'reader-b' }),
+    });
+    const body = await (await app.request(`/syncs/progress/${DOC}`, { headers })).json();
+    expect(body.percentage).toBe(0.6);
+    expect(body.progress).toBe('ahead');
+    expect(body.device_id).toBe('reader-a');
+  });
+
+  it('a device catching back up to the furthest point is reflected once it matches or passes it', async () => {
+    const { app } = makeTestApp();
+    const { headers } = await registerUser(app);
+    await app.request('/syncs/progress', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ document: DOC, progress: 'ahead', percentage: 0.6, device_id: 'reader-a' }),
+    });
+    await app.request('/syncs/progress', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ document: DOC, progress: 'behind', percentage: 0.05, device_id: 'reader-b' }),
+    });
+    await app.request('/syncs/progress', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ document: DOC, progress: 'caught-up', percentage: 0.7, device_id: 'reader-b' }),
+    });
+    const body = await (await app.request(`/syncs/progress/${DOC}`, { headers })).json();
+    expect(body.percentage).toBe(0.7);
+    expect(body.progress).toBe('caught-up');
+    expect(body.device_id).toBe('reader-b');
+  });
 });

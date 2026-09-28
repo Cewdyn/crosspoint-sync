@@ -69,6 +69,38 @@ function tokenOverlap(a: string, b: string): number {
   return inter / (sa.size + sb.size - inter);
 }
 
+/** Strip extension and bare volume/chapter-number tokens (e.g. "01"), normalize. */
+export function filenameStem(filename: string): string {
+  const base = filename.replace(/\.[a-z0-9]+$/i, '');
+  return normalizeText(base)
+    .split(' ')
+    .filter((t) => t && !/^\d+$/.test(t))
+    .join(' ');
+}
+
+/**
+ * Fuzzy filename match for auto-merging documents across clients that name
+ * downloaded files differently (e.g. server's "Series - 01.epub" vs a client-
+ * synthesized "Author - Title.epub" for the same book).
+ *
+ * An exact match after stripping the extension/volume numbers is always
+ * accepted (covers single-word titles like "Pinwheel.epub" vs
+ * "Pinwheel - 01.epub" - there's nothing ambiguous about it). Anything short
+ * of that needs both strong overlap and at least 2 shared distinctive words,
+ * so two unrelated short filenames sharing one common word don't merge.
+ */
+export function filenamesLikelyMatch(a: string, b: string): boolean {
+  const sa = filenameStem(a);
+  const sb = filenameStem(b);
+  if (!sa || !sb) return false;
+  if (sa === sb) return true;
+  const setA = new Set(sa.split(' ').filter(Boolean));
+  const setB = new Set(sb.split(' ').filter(Boolean));
+  let shared = 0;
+  for (const t of setA) if (setB.has(t)) shared++;
+  return shared >= 2 && tokenOverlap(sa, sb) >= 0.5;
+}
+
 export interface Candidate {
   externalId: string;
   title: string;

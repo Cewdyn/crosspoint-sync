@@ -11,9 +11,9 @@ import {
 } from '../auth/middleware.js';
 import { hashKey, looksLikeMd5, md5Hex } from '../auth/password.js';
 import { parsePosition } from '../models/position.js';
-import { resolveDocument } from '../models/merge.js';
+import { findAutoMergeCandidate, mergeDocuments, pickCanonical, resolveDocument } from '../models/merge.js';
 import { nowSeconds } from '../models/sync.js';
-import { fanOutProgress } from '../connectors/fanout.js';
+import { bestProgress, fanOutProgress } from '../connectors/fanout.js';
 import { seedSidecarMatches } from '../connectors/store.js';
 import { getConnector } from '../connectors/registry.js';
 
@@ -159,7 +159,14 @@ export function nearestProgressSample(
   return row ?? null;
 }
 
-export function upsertProgress(db: DB, p: ProgressUpsert): void {
+/**
+ * Upserts progress for a device, plus any metadata it sent. Returns the
+ * document's final canonical id: if the metadata triggers an auto-merge with
+ * an existing, differently-hashed document for the same book, that's a
+ * *different* id than `p.document` - callers must use the return value for
+ * anything after this, not the id they passed in.
+ */
+export function upsertProgress(db: DB, p: ProgressUpsert): string {
   db.prepare(
     `INSERT INTO progress (user_id, document, device_id, device, percentage, progress, position, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -170,21 +177,42 @@ export function upsertProgress(db: DB, p: ProgressUpsert): void {
        position = COALESCE(excluded.position, progress.position),
        updated_at = excluded.updated_at`
   ).run(p.userId, p.document, p.deviceId, p.device, p.percentage, p.progress, p.position, p.updatedAt);
+  let document = p.document;
   if (p.metadata) {
-    upsertDocumentMetadata(db, p.userId, p.document, p.metadata, p.updatedAt);
+    upsertDocumentMetadata(db, p.userId, document, p.metadata, p.updatedAt);
     // Exact service ids from the plugin sidecar bypass fuzzy matching: seed the
     // connector match cache so the runner pushes straight to that record.
     if (Object.keys(p.metadata.externalIds).length > 0) {
       seedSidecarMatches(
         db,
         p.userId,
-        p.document,
+        document,
         p.metadata.externalIds,
         (id) => getConnector(id) !== undefined,
         p.updatedAt
       );
     }
+    // Auto-merge: if this looks like the same book as an existing, differently-
+    // hashed document (two clients disagreeing on how to identify a file, e.g.
+    // two devices each downloading it under their own local filename), link
+    // them automatically instead of requiring a manual "Merge" click every time
+    // a book gets touched on both devices.
+    const candidate = findAutoMergeCandidate(db, p.userId, document, {
+      title: p.metadata.title,
+      author: p.metadata.authors,
+      filename: p.metadata.filename,
+    });
+    if (candidate) {
+      const resolvedThis = resolveDocument(db, p.userId, document);
+      const resolvedOther = resolveDocument(db, p.userId, candidate);
+      if (resolvedThis !== resolvedOther) {
+        const { canonical, alias } = pickCanonical(db, p.userId, resolvedThis, resolvedOther);
+        mergeDocuments(db, p.userId, alias, canonical, p.updatedAt);
+        document = canonical;
+      }
+    }
   }
+  return document;
 }
 
 /**
@@ -298,19 +326,23 @@ export function kosyncRoutes(db: DB, config: Config, refreshProgress: ProgressRe
     // hash back so the device recognizes the response.
     const clientDocument = parsed.record.document;
     parsed.record.document = resolveDocument(db, user.id, clientDocument);
-    upsertProgress(db, parsed.record);
+    // upsertProgress can trigger its own auto-merge (metadata just seen makes
+    // this look like an already-known book under a different hash) - use its
+    // returned id, which may differ from what we resolved above, for everything
+    // that follows.
+    const canonicalDocument = upsertProgress(db, parsed.record);
     // Harvest this real device position as a (percentage -> position) sample so
     // fan-in can later replay a real position for a percentage-only update.
     recordProgressSample(
       db,
       user.id,
-      parsed.record.document,
+      canonicalDocument,
       parsed.record.percentage,
       parsed.record.progress,
       parsed.record.position,
       parsed.record.updatedAt
     );
-    fanOutProgress(db, user.id, parsed.record.document, parsed.record.percentage, parsed.record.updatedAt, parsed.record.progress, parsed.record.position);
+    fanOutProgress(db, user.id, canonicalDocument, parsed.record.percentage, parsed.record.updatedAt, parsed.record.progress, parsed.record.position);
     return c.json({ document: clientDocument, timestamp: parsed.record.updatedAt });
   });
 
@@ -327,22 +359,10 @@ export function kosyncRoutes(db: DB, config: Config, refreshProgress: ProgressRe
       const status = error instanceof Error && error.name === 'TimeoutError' ? 504 : 502;
       return c.json({ code: 2003, message: 'BookFusion progress refresh failed' }, status);
     }
-    const row = db
-      .prepare(
-        `SELECT document, progress, percentage, device, device_id, updated_at
-         FROM progress WHERE user_id = ? AND document = ?
-         ORDER BY updated_at DESC, device_id LIMIT 1`
-      )
-      .get(user.id, canonical) as
-      | {
-          document: string;
-          progress: string;
-          percentage: number;
-          device: string;
-          device_id: string;
-          updated_at: number;
-        }
-      | undefined;
+    // Furthest-along across all devices, not just whichever synced most
+    // recently - otherwise pulling here can hand a device an older position
+    // than the one it (or another device) already reached.
+    const row = bestProgress(db, user.id, canonical);
     if (!row) {
       // Stock kosync returns 200 with an empty object; KOReader clients rely on it.
       return c.json({});

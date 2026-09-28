@@ -3,6 +3,7 @@ import {
   coreTitle,
   decideMatch,
   extractTitleAuthor,
+  filenamesLikelyMatch,
   normalizeAuthor,
   scoreCandidate,
 } from '../src/connectors/matching.js';
@@ -79,5 +80,31 @@ describe('matching helpers', () => {
 
   it('returns unaccepted for empty candidates', () => {
     expect(decideMatch('X', 'Y', []).accepted).toBe(false);
+  });
+
+  describe('filenamesLikelyMatch', () => {
+    it('matches a server-format name against a client-synthesized author-title name', () => {
+      // Same book, two clients that name downloaded files completely differently.
+      expect(filenamesLikelyMatch('Ana and Din Mysteries - 01.epub', 'R Bennett - Ana and Din Mysteries.epub')).toBe(
+        true
+      );
+    });
+
+    it('ignores bare volume/chapter numbers as distinguishing content', () => {
+      expect(filenamesLikelyMatch('Pinwheel - 01.epub', 'Pinwheel.epub')).toBe(true);
+    });
+
+    it('does not match unrelated books', () => {
+      expect(filenamesLikelyMatch('Ana and Din Mysteries - 01.epub', 'Golden Fields.epub')).toBe(false);
+    });
+
+    it('does not match on a single shared common word', () => {
+      expect(filenamesLikelyMatch('The Great Adventure.epub', 'The Lost City.epub')).toBe(false);
+    });
+
+    it('handles empty/unusable input without throwing', () => {
+      expect(filenamesLikelyMatch('', 'Something.epub')).toBe(false);
+      expect(filenamesLikelyMatch('01.epub', '02.epub')).toBe(false); // nothing but volume numbers
+    });
   });
 });

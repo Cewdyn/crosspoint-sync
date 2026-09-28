@@ -53,6 +53,34 @@ function fanOut(
   }
 }
 
+interface ProgressRow {
+  percentage: number;
+  progress: string;
+  position: string | null;
+  device: string;
+  device_id: string;
+  updated_at: number;
+}
+
+/**
+ * The furthest-along progress across every device syncing this (canonical)
+ * document. Multiple devices (e.g. two e-readers on the same book) each keep
+ * their own row, and any one of them can trigger a fan-out - without this,
+ * whichever device happens to sync last wins, even if it's a stale/behind
+ * device re-announcing old progress. Ties broken by most recently updated.
+ */
+export function bestProgress(db: DB, userId: number, document: string): ProgressRow | null {
+  const row = db
+    .prepare(
+      `SELECT percentage, progress, position, device, device_id, updated_at FROM progress
+       WHERE user_id = ? AND document = ?
+       ORDER BY percentage DESC, updated_at DESC
+       LIMIT 1`
+    )
+    .get(userId, document) as ProgressRow | undefined;
+  return row ?? null;
+}
+
 export function fanOutProgress(
   db: DB,
   userId: number,
@@ -63,11 +91,22 @@ export function fanOutProgress(
   positionJson?: string | null,
   exceptConnectorId?: string
 ): void {
-  const finished = percentage >= 0.98;
+  // Use the best-known progress across all devices for this document, not
+  // necessarily the event that just triggered this call - a lagging device
+  // re-syncing its own old position should never regress what gets pushed
+  // downstream. The row for this very event is already in the DB by the time
+  // this runs (upsertProgress commits before fanOutProgress is called), so it's
+  // included in the comparison automatically.
+  const best = bestProgress(db, userId, document);
+  const effectivePercentage = best?.percentage ?? percentage;
+  const effectiveProgress = best?.progress ?? progress;
+  const effectivePositionJson = best ? best.position : positionJson;
+
+  const finished = effectivePercentage >= 0.98;
   let position: Record<string, unknown> | null = null;
-  if (positionJson) {
+  if (effectivePositionJson) {
     try {
-      position = JSON.parse(positionJson) as Record<string, unknown>;
+      position = JSON.parse(effectivePositionJson) as Record<string, unknown>;
     } catch {
       position = null;
     }
@@ -78,8 +117,8 @@ export function fanOutProgress(
     {
       kind: finished ? 'finished' : 'progress',
       document,
-      percentage,
-      progress,
+      percentage: effectivePercentage,
+      progress: effectiveProgress,
       position,
       timestamp,
     },

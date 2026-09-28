@@ -1,4 +1,5 @@
 import { withTransaction, type DB } from '../db/db.js';
+import { coreTitle, filenamesLikelyMatch, normalizeAuthor, normalizeText } from '../connectors/matching.js';
 
 /**
  * Manual document merges. The kosync document key is client-computed and
@@ -112,4 +113,96 @@ export function unmergeDocument(db: DB, userId: number, alias: string): boolean 
     .prepare('DELETE FROM document_aliases WHERE user_id = ? AND alias = ?')
     .run(userId, alias);
   return res.changes > 0;
+}
+
+interface DocRow {
+  document: string;
+  title: string | null;
+  author: string | null;
+  filename: string | null;
+}
+
+/**
+ * Find an existing, different, not-already-linked document that's probably the
+ * same book under a different client-computed hash. Two clients that disagree
+ * on document identity (KOReader binary MD5 vs a device's own filename MD5, or
+ * two devices saving a downloaded file under different local names) otherwise
+ * sync as unrelated books forever.
+ *
+ * Matched by exact title (case/punctuation-insensitive, subtitle stripped) with
+ * author agreement when both sides have one - the strong signal, when a device
+ * sends real metadata. Falls back to fuzzy filename word-overlap for devices
+ * that only ever send `filename` (e.g. firmware that can't reliably read an
+ * EPUB's internal title), since two devices' local filenames for the same book
+ * still share its distinctive title words even when formatted completely
+ * differently (a server-provided "Series - 01.epub" vs a client-synthesized
+ * "Author - Title.epub").
+ */
+export function findAutoMergeCandidate(
+  db: DB,
+  userId: number,
+  document: string,
+  meta: { title?: string | null; author?: string | null; filename?: string | null }
+): string | null {
+  const rows = db
+    .prepare('SELECT document, title, author, filename FROM documents WHERE user_id = ? AND document != ?')
+    .all(userId, document) as unknown as DocRow[];
+  if (rows.length === 0) return null;
+
+  const titleKey = meta.title ? normalizeText(coreTitle(meta.title)) : '';
+  const authorKey = meta.author ? normalizeAuthor(meta.author) : '';
+
+  for (const r of rows) {
+    if (titleKey && r.title) {
+      // Both sides have title info for this pair - judge it on title/author
+      // alone, never rescue a mismatch via filename fuzzy-matching.
+      if (
+        normalizeText(coreTitle(r.title)) === titleKey &&
+        (!authorKey || !r.author || normalizeAuthor(r.author) === authorKey)
+      ) {
+        return r.document;
+      }
+      continue;
+    }
+    // At least one side has no title at all (e.g. a device that only ever
+    // sends `filename`) - the only signal available is filename overlap.
+    if (meta.filename && r.filename && filenamesLikelyMatch(meta.filename, r.filename)) {
+      return r.document;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Decide which of two documents stays canonical when auto-merging: prefer
+ * whichever already has connector matches (so established integrations aren't
+ * orphaned), then whichever has been syncing longer (stable, not just "whoever
+ * pushed most recently").
+ */
+export function pickCanonical(
+  db: DB,
+  userId: number,
+  a: string,
+  b: string
+): { canonical: string; alias: string } {
+  const matchCount = (doc: string): number =>
+    (
+      db
+        .prepare('SELECT COUNT(*) as c FROM connector_matches WHERE user_id = ? AND document = ?')
+        .get(userId, doc) as { c: number }
+    ).c;
+  const aMatches = matchCount(a);
+  const bMatches = matchCount(b);
+  if (aMatches !== bMatches) {
+    return aMatches > bMatches ? { canonical: a, alias: b } : { canonical: b, alias: a };
+  }
+
+  const firstSeen = (doc: string): number =>
+    (
+      db
+        .prepare('SELECT MIN(updated_at) as t FROM progress WHERE user_id = ? AND document = ?')
+        .get(userId, doc) as { t: number | null }
+    ).t ?? Number.POSITIVE_INFINITY;
+  return firstSeen(a) <= firstSeen(b) ? { canonical: a, alias: b } : { canonical: b, alias: a };
 }
